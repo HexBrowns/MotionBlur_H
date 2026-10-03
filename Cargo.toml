@@ -1,0 +1,27 @@
+[package]
+name = "motion-blur-h"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "MotionBlur_H - MotionBlur_K (Korarei) の Rust フォーク（ObjectMotionBlur_H / SceneMotionBlur_H）"
+publish = false
+
+[lib]
+name = "motion_blur_h"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aviutl2 = { version = "0.48", features = ["generic", "filter"] }
+parking_lot = "0.12"
+tracing = "0.1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_LibraryLoader",
+] }
+
+[profile.release]
+lto = true

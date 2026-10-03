@@ -1,3 +1,7 @@
+<!-- 原作 MotionBlur_K v2.0.2（Korarei）の THIRD_PARTY_LICENSES.md をそのまま引き継いだもの。
+     Rust 版が写したのは NVIDIA Optical Flow SDK のヘッダー（src/scene/nvof.rs）と PCG3D（shaders/blur.hlsl）。
+     Rust の依存クレートの表記は THIRD_PARTY_CRATES.md -->
+
 # Third Party Licenses
 
 ## [AviUtl ExEdit2 Plugin SDK](https://spring-fragrance.mints.ne.jp/aviutl/)
