@@ -1,5 +1,7 @@
 # MotionBlur_H（ObjectMotionBlur_H / SceneMotionBlur_H）
 
+<img src="images/MotionBlur_H_thumbnail.gif" width="360">
+
 モーションブラーのフィルタ効果 2 つです。Korarei さんの MotionBlur_K（v2.0.2）を Rust で作り直したもので、設定項目の名前は日本語にしてあります。
 
 | 効果 | 何をするか |
