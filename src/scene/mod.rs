@@ -146,23 +146,53 @@ impl FilterPlugin for SceneMotionBlur {
         video: &mut FilterProcVideo<Self::Userdata>,
     ) -> AnyResult<()> {
         let cfg: SceneConfig = config.to_struct();
-        if let Err(e) = apply(&cfg, video) {
-            tracing::error!("SceneMotionBlur_H: {e}");
+        // 非対応の環境（NVIDIA 以外）や個別オブジェクト・グループ制御では毎フレーム失敗するので、原因ごとに初回だけ出す
+        if let Err(f) = apply(&cfg, video) {
+            if crate::log_once::first(&f.cause) {
+                tracing::error!("SceneMotionBlur_H: {}{}", f.message, crate::log_once::SUFFIX);
+            }
         }
         Ok(())
+    }
+}
+
+/// 描けなかった理由。`cause` が同じものはログに初回だけ出す。
+struct Failure {
+    /// 原因のキー。フレーム番号のように毎回変わる値を入れない
+    cause: String,
+    message: String,
+}
+
+impl Failure {
+    fn new(cause: &str, message: impl Into<String>) -> Self {
+        Failure {
+            cause: format!("smb:{cause}"),
+            message: message.into(),
+        }
+    }
+}
+
+/// 本体・D3D11・NVOF の失敗は、文言そのものを原因のキーにする（フレーム番号を含まない）
+impl<E: std::fmt::Display> From<E> for Failure {
+    fn from(e: E) -> Self {
+        let message = e.to_string();
+        Failure {
+            cause: format!("smb:{message}"),
+            message,
+        }
     }
 }
 
 const EPSILON: f32 = 1.0e-5;
 const DEPTH: &str = "smb_h_depth";
 
-fn apply(cfg: &SceneConfig, video: &mut FilterProcVideo<Instance>) -> Result<(), Box<dyn std::error::Error>> {
+fn apply(cfg: &SceneConfig, video: &mut FilterProcVideo<Instance>) -> Result<(), Failure> {
     let (w, h) = (video.video_object.width, video.video_object.height);
     if w == 0 || h == 0 {
         return Ok(());
     }
     if video.video_object.num != Some(1) {
-        return Err("This effect only supports a single object".into());
+        return Err(Failure::new("not_single_object", "This effect only supports a single object"));
     }
     let angle = cfg.angle as f32;
     if angle <= EPSILON {
@@ -178,7 +208,12 @@ fn apply(cfg: &SceneConfig, video: &mut FilterProcVideo<Instance>) -> Result<(),
         let rs = video.read_section();
         let object = rs
             .find_object_after(effect_layer as usize, frame.max(0) as usize)?
-            .ok_or_else(|| format!("No object exists at layer {}, frame {}", effect_layer + 1, frame))?;
+            .ok_or_else(|| {
+                Failure::new(
+                    "no_object_at_effect_layer",
+                    format!("No object exists at layer {}, frame {}", effect_layer + 1, frame),
+                )
+            })?;
         let n = rs.get_object_section_num(object)?;
         let mut section = 0i64;
         while (section as usize) < n && rs.get_object_section_frame(object, section as usize)? as i64 <= frame {
@@ -198,7 +233,10 @@ fn apply(cfg: &SceneConfig, video: &mut FilterProcVideo<Instance>) -> Result<(),
         if layer < 0 || layer == video.object.layer as i64 {
             video.create_image_resource(&res, &[255u8, 255, 255, 255], 1, 1)?;
         } else if video.get_image_object(layer as u32, 0.0).is_none() {
-            return Err(format!("No object exists at layer {}, frame {}", layer + 1, frame).into());
+            return Err(Failure::new(
+                &format!("depth_layer_missing:{layer}"),
+                format!("No object exists at layer {}, frame {}", layer + 1, frame),
+            ));
         } else {
             video.copy_image_resource(
                 &ImageResource::Layer {
@@ -292,5 +330,33 @@ fn apply(cfg: &SceneConfig, video: &mut FilterProcVideo<Instance>) -> Result<(),
 
     let curr = inst.curr.tex.as_ref().unwrap();
     let target = if use_prev { inst.prev.tex.as_ref().unwrap() } else { curr };
-    gpu::render(&mut inst.session, &dst, curr, target, &depth.0, &params)
+    gpu::render(&mut inst.session, &dst, curr, target, &depth.0, &params)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_cause_excludes_frame() {
+        // 同じ原因なら、フレームが違っても同じキーになる（毎フレーム「初回」にならない）
+        let a = Failure::new("no_object_at_effect_layer", format!("No object exists at layer {}, frame {}", 3, 10));
+        let b = Failure::new("no_object_at_effect_layer", format!("No object exists at layer {}, frame {}", 3, 11));
+        assert_eq!(a.cause, b.cause);
+        assert_ne!(a.message, b.message);
+    }
+
+    #[test]
+    fn failure_from_error_keeps_message() {
+        let e = nvof::NvofError {
+            status: nvof::NV_OF_ERR_OF_NOT_AVAILABLE,
+            context: "load nvofapi64.dll",
+        };
+        let f: Failure = e.into();
+        assert!(f.message.contains("load nvofapi64.dll"));
+        assert_eq!(f.cause, format!("smb:{}", f.message));
+        let g: Failure = "Failed to get 'ID3D11Texture2D' pointers".into();
+        assert_ne!(f.cause, g.cause);
+    }
 }

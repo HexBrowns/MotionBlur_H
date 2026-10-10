@@ -10,6 +10,7 @@
 
 pub mod cache;
 pub mod filter;
+pub mod log_once;
 pub mod pose;
 pub mod render;
 pub mod scene;
@@ -57,6 +58,9 @@ impl aviutl2::generic::GenericPlugin for MotionBlurH {
     fn on_clear_cache(&mut self, _edit_section: &aviutl2::generic::EditSection) {
         cache::clear_all();
         scene::gpu::reset();
+        filter::release_zeros();
+        // 初回だけにしていた失敗のログを、もう一度出せるようにする
+        log_once::reset();
     }
 
     fn event_update_object_info(&mut self) {

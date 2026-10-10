@@ -316,7 +316,6 @@ struct Level {
 }
 
 pub struct Session {
-    of: nvof::Session,
     inputs: [(nvof::Buffer, ID3D11RenderTargetView); 2],
     outputs: [(nvof::Buffer, ID3D11ShaderResourceView); 2],
     costs: [(nvof::Buffer, ID3D11ShaderResourceView); 2],
@@ -325,6 +324,9 @@ pub struct Session {
     vp: D3D11_VIEWPORT,
     pub key: SessionKey,
     generation: u64,
+    /// **最後に置く。** Rust はフィールドを宣言の順に片付けるので、先に置くと `nvOFDestroy` の後で
+    /// 各 Buffer の Drop が壊したセッションへ `nvOFUnregisterResourceD3D11` を呼ぶ（公開前チェックリストの点検で見つけた）
+    of: nvof::Session,
 }
 
 unsafe impl Send for Session {}

@@ -22,6 +22,7 @@ use aviutl2::generic::{EditState, EffectHandle};
 use aviutl2::AnyResult;
 
 use crate::cache::{self, Key, Lookup, ParamPart, RecordInfo};
+use crate::log_once;
 use crate::pose::{self, Pose, Transform, Vec2, EPSILON};
 use crate::render;
 
@@ -191,8 +192,60 @@ impl FilterPlugin for ObjectMotionBlur {
         video: &mut FilterProcVideo<Self::Userdata>,
     ) -> AnyResult<()> {
         let cfg: Config = config.to_struct();
-        apply(&cfg, video)
+        // 失敗は毎フレーム起きるので、ログは原因ごとに初回だけ。止め方は Err を返したときと同じにする:
+        // 以降のフィルタと出力を止め、途中で変えた param（中心）は本体へ書き戻さない（Err のときは aviutl2-rs が書き戻さない）
+        let saved = video.param.clone();
+        if let Err(e) = apply(&cfg, video) {
+            let message = e.to_string();
+            if log_once::first(&format!("omb:proc:{message}")) {
+                tracing::error!("ObjectMotionBlur_H: {message}{}", log_once::SUFFIX);
+            }
+            video.param = saved;
+            video.prevent_post_effect();
+        }
+        Ok(())
     }
+}
+
+/// 本体の画像の一辺の上限（`obj.getinfo("image_max")` と同じ。ルール au2-conventions「API 重要事項」）
+pub const MAX_IMAGE_SIZE: u32 = 16384;
+
+/// 使い回す 0 埋めのバッファを持ち続ける上限。これより大きく要ったときは、使い終わったら手放す（256 MiB = 8192x8192）
+const KEEP_ZERO_BYTES: usize = 256 << 20;
+
+/// 大きさを変えるときに `set_image_data` へ渡す 0 埋めのバッファ（フレームをまたいで使い回す。中身は 0 のまま書き換えない）
+static ZEROS: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
+
+/// 使い回している 0 埋めのバッファを手放す（「キャッシュを破棄」）。貸し出し中なら何もしない
+pub fn release_zeros() {
+    if let Some(mut pool) = ZEROS.try_lock() {
+        *pool = Vec::new();
+    }
+}
+
+/// `len` バイトの 0 を `f` に貸す。確保できなければ `None`。
+///
+/// `vec![0u8; n]` は確保に失敗すると abort して本体ごと落ちる（リサイズで一辺 16384 まで広がると 1 GiB）ので、
+/// 失敗を返せる `try_reserve_exact` で確保する。別のスレッドが貸し出し中なら、待たずにその場で確保して捨てる。
+fn with_zeros<R>(len: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    match ZEROS.try_lock() {
+        Some(mut pool) => lend_zeros(&mut pool, len, KEEP_ZERO_BYTES, f),
+        None => lend_zeros(&mut Vec::new(), len, 0, f),
+    }
+}
+
+/// `pool` を `len` バイト以上の 0 にして、先頭 `len` バイトを `f` に貸す。貸した後に `keep` バイトより大きければ手放す。
+fn lend_zeros<R>(pool: &mut Vec<u8>, len: usize, keep: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if pool.len() < len {
+        // 足りない分だけ足す。前からある分も 0 のまま（貸すのは共有参照だけ）
+        pool.try_reserve_exact(len - pool.len()).ok()?;
+        pool.resize(len, 0);
+    }
+    let result = f(&pool[..len]);
+    if pool.len() > keep {
+        *pool = Vec::new();
+    }
+    Some(result)
 }
 
 struct GroupRef {
@@ -220,7 +273,9 @@ fn collect_groups(video: &mut FilterProcVideo<()>) -> Vec<GroupRef> {
     let mut groups = Vec::with_capacity(handles.len());
     for h in handles.iter().rev() {
         let Ok(effect) = rs.find_effect(*h, "グループ制御", 0) else {
-            tracing::warn!("グループ制御のエフェクトが見つからない");
+            if log_once::first("omb:group_effect_missing") {
+                tracing::warn!("グループ制御のエフェクトが見つからない{}", log_once::SUFFIX);
+            }
             continue;
         };
         let Ok(lf) = rs.get_object_layer_frame(*h) else {
@@ -470,7 +525,9 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
     }
     if let Some(num) = video.video_object.num {
         if video.video_object.index >= num {
-            tracing::warn!("Unable to determine object count");
+            if log_once::first("omb:object_count") {
+                tracing::warn!("Unable to determine object count{}", log_once::SUFFIX);
+            }
             return Ok(());
         }
     }
@@ -492,7 +549,15 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
     let live0 = match live_at(video, &groups, local, local, spf) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Failed to get object transform at layer {}, frame {}: {e}", layer + 1, origin);
+            // キーに層とフレームを混ぜない（フレームが進むたびに「初回」になる）
+            if log_once::first(&format!("omb:live:{e}")) {
+                tracing::error!(
+                    "Failed to get object transform at layer {}, frame {}: {e}{}",
+                    layer + 1,
+                    origin,
+                    log_once::SUFFIX
+                );
+            }
             return Ok(());
         }
     };
@@ -582,11 +647,12 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
         }
     };
 
-    if curr.links.len() > render::MAX_LINKS {
+    if curr.links.len() > render::MAX_LINKS && log_once::first("omb:nest_too_deep") {
         tracing::warn!(
-            "グループ制御の入れ子が深すぎる（{} 段）。外側の {} 段だけで計算する",
+            "グループ制御の入れ子が深すぎる（{} 段）。外側の {} 段だけで計算する{}",
             curr.links.len(),
-            render::MAX_LINKS
+            render::MAX_LINKS,
+            log_once::SUFFIX
         );
     }
 
@@ -604,28 +670,49 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
             (metrics.max.x - metrics.min.x).ceil(),
             (metrics.max.y - metrics.min.y).ceil(),
         );
-        let (resolution, origin_px) = if size.x > 16384.0 || size.y > 16384.0 {
-            tracing::warn!("Image size exceeds maximum limit of 16384x16384");
-            let r = Vec2::new(size.x.min(16384.0), size.y.min(16384.0));
-            (r, metrics.min + (size - r) * 0.5)
+        let max = MAX_IMAGE_SIZE as f32;
+        if size.x > max || size.y > max {
+            if log_once::first("omb:too_large") {
+                tracing::warn!(
+                    "Image size {}x{} exceeds maximum limit of {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE}; clipped{}",
+                    size.x,
+                    size.y,
+                    log_once::SUFFIX
+                );
+            }
+            let r = Vec2::new(size.x.min(max), size.y.min(max));
+            (metrics.min + (size - r) * 0.5, r)
         } else {
-            (size, metrics.min)
-        };
-        video.param.cx -= origin_px.x + (resolution.x - dims.x) * 0.5;
-        video.param.cy -= origin_px.y + (resolution.y - dims.y) * 0.5;
-        (origin_px, resolution)
+            (metrics.min, size)
+        }
     } else {
         (Vec2::ZERO, dims)
     };
-    let (rw, rh) = (resolution.x.max(1.0) as u32, resolution.y.max(1.0) as u32);
+    let max = MAX_IMAGE_SIZE as f32;
+    // clamp は NaN を NaN のまま返す（u32 にすると 0）ので max → min の順にする
+    let (rw, rh) = (resolution.x.max(1.0).min(max) as u32, resolution.y.max(1.0).min(max) as u32);
 
     let image = ImageResource::Resource("omb_h_image".to_string());
     let map = ImageResource::Resource("omb_h_map".to_string());
     video.copy_image_resource(&ImageResource::Object, &image)?;
     if rw != w || rh != h {
-        // 本体の set_image_data は null で「中身なしの大きさ変更」になるが、aviutl2-rs は null を渡せないので 0 で埋める
-        let blank = vec![0u8; rw as usize * rh as usize * 4];
-        video.set_image_data(&blank, rw, rh);
+        // 本体の set_image_data は null で「中身なしの大きさ変更」になるが、aviutl2-rs は null を渡せないので 0 で埋める。
+        // 確保できなければ、元の画像のまま（ぼかさずに）返す。中心（param）もまだ動かしていない
+        let len = rw as usize * rh as usize * 4;
+        if with_zeros(len, |blank| video.set_image_data(blank, rw, rh)).is_none() {
+            if log_once::first("omb:alloc_failed") {
+                tracing::warn!(
+                    "{rw}x{rh} の画像のメモリ（{} MiB）を確保できないので、ぼかさずに返します{}",
+                    len >> 20,
+                    log_once::SUFFIX
+                );
+            }
+            return Ok(());
+        }
+    }
+    if cfg.resize {
+        video.param.cx -= origin_px.x + (resolution.x - dims.x) * 0.5;
+        video.param.cy -= origin_px.y + (resolution.y - dims.y) * 0.5;
     }
 
     let clear = [0u8; 4];
@@ -636,7 +723,10 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
                     .copy_image_resource(&ImageResource::ImageFile(path.clone()), &map)
                     .is_err()
                 {
-                    tracing::error!("Failed to copy image '{}'", path.display());
+                    // 原因は画像ごと（別の画像を選び直したら、その画像の失敗はまた出す）
+                    if log_once::first(&format!("omb:tint_image:{}", path.display())) {
+                        tracing::error!("Failed to copy image '{}'{}", path.display(), log_once::SUFFIX);
+                    }
                     return Ok(());
                 }
             }
@@ -651,7 +741,10 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
             if map_layer < 0 || map_layer == layer as i64 {
                 video.create_image_resource(&map, &clear, 1, 1)?;
             } else if video.get_image_object(map_layer as u32, 0.0).is_none() {
-                tracing::error!("No object exists at layer {}, frame {}", map_layer + 1, origin);
+                // キーはレイヤーだけ（フレームを混ぜると毎フレーム「初回」になる）
+                if log_once::first(&format!("omb:tint_layer:{map_layer}")) {
+                    tracing::error!("No object exists at layer {}, frame {}{}", map_layer + 1, origin, log_once::SUFFIX);
+                }
                 return Ok(());
             } else {
                 video.copy_image_resource(
@@ -688,7 +781,9 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
     let blend = video.get_blend_state(BlendStateMode::Copy).map(ManuallyDrop::new);
     let sampler = video.get_sampler_state(SamplerMode::Clip).map(ManuallyDrop::new);
     let (Some(blend), Some(sampler)) = (blend, sampler) else {
-        tracing::error!("Failed to get blend / sampler state");
+        if log_once::first("omb:blend_sampler") {
+            tracing::error!("Failed to get blend / sampler state{}", log_once::SUFFIX);
+        }
         return Ok(());
     };
     video.exec_pixelshader_data(
@@ -720,4 +815,50 @@ fn apply(cfg: &Config, video: &mut FilterProcVideo<()>) -> AnyResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lend_zeros_reuses_and_stays_zero() {
+        let mut pool = Vec::new();
+        let n = lend_zeros(&mut pool, 16, 1024, |b| {
+            assert!(b.iter().all(|&x| x == 0));
+            b.len()
+        });
+        assert_eq!(n, Some(16));
+        let cap = pool.capacity();
+        // 小さい要求は確保し直さずに先頭を貸す
+        assert_eq!(lend_zeros(&mut pool, 8, 1024, |b| b.len()), Some(8));
+        assert_eq!(pool.capacity(), cap);
+        // 足りなければ足す。前からある分も 0
+        assert_eq!(lend_zeros(&mut pool, 64, 1024, |b| b.iter().all(|&x| x == 0)), Some(true));
+        assert_eq!(pool.len(), 64);
+    }
+
+    #[test]
+    fn lend_zeros_releases_over_keep() {
+        let mut pool = Vec::new();
+        assert_eq!(lend_zeros(&mut pool, 4096, 1024, |b| b.len()), Some(4096));
+        assert_eq!(pool.capacity(), 0, "上限を超えた分は使い終わったら手放す");
+    }
+
+    #[test]
+    fn lend_zeros_fails_without_abort() {
+        // vec! なら abort する大きさ。確保できないことを None で返す
+        let mut pool = Vec::new();
+        let called = lend_zeros(&mut pool, isize::MAX as usize + 1, KEEP_ZERO_BYTES, |_| ());
+        assert!(called.is_none());
+        assert_eq!(pool.capacity(), 0);
+    }
+
+    #[test]
+    fn max_image_bytes_fit() {
+        // 一辺の上限どうしでも 1 GiB で、usize（と aviutl2-rs の u32 の検査）に収まる
+        let len = MAX_IMAGE_SIZE as usize * MAX_IMAGE_SIZE as usize * 4;
+        assert_eq!(len, 1 << 30);
+        assert!(MAX_IMAGE_SIZE.checked_mul(MAX_IMAGE_SIZE).and_then(|v| v.checked_mul(4)).is_some());
+    }
 }

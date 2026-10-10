@@ -31,8 +31,11 @@ Korarei の MotionBlur_K v2.0.2（MIT）の Rust フォーク。フィルタ効�
 ## ビルド
 
 ```powershell
-& "C:\ProgramData\aviutl2\AI\plugins\MotionBlur_H\build.ps1"
+python AI/tools/au2_build.py MotionBlur_H               # au2 release → 本番（C:\ProgramData\aviutl2）へ配置
+python AI/tools/au2_build.py MotionBlur_H --no-deploy   # 配置しない（本番との違いだけ出す）
 ```
+
+ビルドと同梱物は `aviutl2.toml`（[aviutl2-cli](https://github.com/sevenc-nanashi/aviutl2-cli)）が正本。このフォルダで `au2 release` だけを実行すると `release/` に au2pkg ができる。
 
 テスト → リリースビルド → `Plugin/MotionBlur_H/MotionBlur_H.aux2` へ配置。差し替えは AviUtl2 の再起動が要る。
 シェーダー（`shaders/blur.hlsl`）は `build.rs` が Windows SDK の fxc でコンパイルして埋め込む。
